@@ -1,7 +1,8 @@
 import SwiftUI
 
 @main struct PeroxideApp: App {
-    @StateObject private var bulb = Bulb()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    @StateObject private var bulb = Bulb.shared
 
     var body: some Scene {
         MenuBarExtra("Peroxide", systemImage: bulb.on ? "lightbulb.led.fill" : "lightbulb.led") {
@@ -11,13 +12,43 @@ import SwiftUI
     }
 }
 
+@MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
+    private lazy var window: NSWindow = {
+        let w = NSWindow(contentViewController: NSHostingController(rootView: Panel().environmentObject(Bulb.shared)))
+        w.title = "Peroxide"
+        w.isReleasedWhenClosed = false
+        w.center()
+        return w
+    }()
+
+    func applicationWillFinishLaunching(_ n: Notification) {
+        guard let id = Bundle.main.bundleIdentifier,
+              let other = NSRunningApplication.runningApplications(withBundleIdentifier: id).first(where: { $0 != .current })
+        else { return }
+        if let url = other.bundleURL { NSWorkspace.shared.open(url) }
+        exit(0)
+    }
+
+    func applicationDidFinishLaunching(_ n: Notification) { show() }
+
+    func applicationShouldHandleReopen(_ app: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        show()
+        return false
+    }
+
+    private func show() {
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+    }
+}
+
 struct Panel: View {
     @EnvironmentObject var bulb: Bulb
     @State private var adding = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if adding || bulb.devices.isEmpty { Setup { adding = false } } else { Controls { adding = true } }
+            if bulb.calibration != nil { ClapSetup() } else if adding || bulb.devices.isEmpty { Setup { adding = false } } else { Controls { adding = true } }
             Divider()
             HStack {
                 if let e = bulb.error { Text(e).font(.caption).foregroundStyle(.red).lineLimit(2) }
@@ -90,7 +121,10 @@ struct Controls: View {
         Divider()
         HStack {
             Image(systemName: "waveform").frame(width: 18).foregroundStyle(.secondary).accessibilityHidden(true)
-            Picker("Listen", selection: .init(get: { bulb.micMode }, set: bulb.setMicMode)) {
+            Picker("Listen", selection: .init(get: { bulb.micMode }, set: {
+                bulb.setMicMode($0)
+                if $0 == .clap, !bulb.clapCalibrated { bulb.startCalibration() }
+            })) {
                 Text("Off").tag(Mic.Mode.off)
                 Text("Clap").tag(Mic.Mode.clap)
                 Text("Music").tag(Mic.Mode.music)
@@ -99,6 +133,18 @@ struct Controls: View {
             .labelsHidden()
         }
         .help("Clap: double snap or clap at the mic toggles the light. Music: the light pulses to what your Mac is playing.")
+
+        if bulb.micMode == .clap {
+            HStack {
+                Image(systemName: "dial.medium").frame(width: 18).foregroundStyle(.secondary).accessibilityHidden(true)
+                Slider(value: $bulb.clapSensitivity).accessibilityLabel("Clap sensitivity")
+                Button(action: bulb.startCalibration) { Image(systemName: "wand.and.stars") }
+                    .buttonStyle(.borderless)
+                    .help("Clap assisted setup")
+                    .accessibilityLabel("Clap assisted setup")
+            }
+            .help("Clap sensitivity: higher picks up quieter claps, but also more false triggers")
+        }
 
         if bulb.micMode == .music {
             HStack {
@@ -151,6 +197,96 @@ struct Controls: View {
     private func gradient(_ c: [Color]) -> some View {
         Capsule().fill(LinearGradient(colors: c, startPoint: .leading, endPoint: .trailing)).frame(height: 4).opacity(0.8)
     }
+}
+
+struct ClapSetup: View {
+    @EnvironmentObject var bulb: Bulb
+
+    var body: some View {
+        let c = bulb.calibration ?? ClapCalibrator()
+        VStack(spacing: 12) {
+            Group {
+                switch c.phase {
+                case .room: Image(systemName: "ear").symbolEffect(.pulse)
+                case .clap: Image(systemName: "hands.clap.fill").symbolEffect(.bounce, value: c.claps.count)
+                case .done: Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                case .failed: Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                }
+            }
+            .font(.system(size: 34))
+            .frame(height: 40)
+            .transition(.scale.combined(with: .opacity))
+
+            Text(title(c)).font(.headline)
+            Text(subtitle(c)).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Waveform(levels: bulb.levels)
+            Text("\(db(bulb.levels.last ?? 0)) dB").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+
+            if c.phase == .clap {
+                HStack(spacing: 8) {
+                    ForEach(0..<2, id: \.self) { i in
+                        Circle().fill(i < c.claps.count ? Color.accentColor : .secondary.opacity(0.3))
+                            .frame(width: 10, height: 10)
+                            .scaleEffect(i < c.claps.count ? 1.3 : 1)
+                    }
+                }
+                .animation(.spring(duration: 0.3), value: c.claps.count)
+            }
+
+            HStack {
+                if case .failed = c.phase { Button("Try Again", action: bulb.startCalibration) }
+                Spacer()
+                if case .done = c.phase {
+                    Button("Done", action: bulb.endCalibration).keyboardShortcut(.defaultAction)
+                } else {
+                    Button("Cancel", action: bulb.endCalibration).keyboardShortcut(.cancelAction)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .animation(.spring(duration: 0.4), value: c.phase)
+    }
+
+    private func title(_ c: ClapCalibrator) -> String {
+        switch c.phase {
+        case .room: "Listening to your room"
+        case .clap: "Now clap twice"
+        case .done: "All set"
+        case .failed: "Let's try that again"
+        }
+    }
+
+    private func subtitle(_ c: ClapCalibrator) -> String {
+        switch c.phase {
+        case .room: "Keep things as they normally are for a few seconds, music, talking, whatever."
+        case .clap: "Clap the way you would to toggle the light."
+        case .done: "Sensitivity set to \(Int(bulb.clapSensitivity * 100))%. Room \(db(c.noise)) dB, claps \(db(c.claps.min() ?? 0)) dB."
+        case .failed(let why): why
+        }
+    }
+
+    private func db(_ p: Float) -> Int { Int(20 * log10(max(p, 1e-5))) }
+}
+
+struct Waveform: View {
+    let levels: [Float]
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(levels.indices, id: \.self) { i in
+                Capsule()
+                    .fill(Color.accentColor.opacity(0.3 + 0.7 * Double(i) / Double(levels.count)))
+                    .frame(width: 3, height: 4 + 52 * Self.height(levels[i]))
+            }
+        }
+        .frame(height: 60)
+        .animation(.easeOut(duration: 0.08), value: levels)
+        .accessibilityHidden(true)
+    }
+
+    static func height(_ p: Float) -> CGFloat { CGFloat(max(0, min(1, (20 * log10(max(p, 1e-5)) + 60) / 60))) }
 }
 
 struct Setup: View {

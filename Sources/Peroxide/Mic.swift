@@ -24,6 +24,35 @@ struct ClapDetector {
     }
 }
 
+struct ClapCalibrator {
+    enum Phase: Equatable { case room, clap, done(thresh: Float), failed(String) }
+    private(set) var phase = Phase.room
+    private(set) var claps: [Float] = []
+    private var roomSum: Float = 0, roomBlocks = 0
+    private var start: Double?, lastClap = -1.0
+    var noise: Float { roomSum / Float(max(roomBlocks, 1)) }
+    var clapLevel: Float { max(noise * 4, 0.02) }
+
+    mutating func feed(peak: Float, now: Double) {
+        let t0 = start ?? now
+        start = t0
+        switch phase {
+        case .room:
+            roomSum += peak
+            roomBlocks += 1
+            if now - t0 > 2.5 { phase = .clap; start = now }
+        case .clap:
+            if peak > clapLevel {
+                if now - lastClap > 0.15 { claps.append(peak); lastClap = now }
+                else { claps[claps.count - 1] = max(claps[claps.count - 1], peak) }
+            }
+            if claps.count >= 2, now - lastClap > 0.3 { phase = .done(thresh: max(clapLevel, claps.min()! * 0.3)) }
+            else if now - t0 > 10 { phase = .failed("Didn't hear two claps over the noise. Clap louder or closer to your Mac.") }
+        case .done, .failed: break
+        }
+    }
+}
+
 struct MusicFollower {
     private var loudest: Float = 0.003
 
@@ -80,6 +109,9 @@ final class Mic {
     var onMusic: (_ level: Double) -> Void = { _ in }
     var band = Band.all
     var gain: Float = 1
+    var clapThresh: Float = 0.07
+    var onLevel: (_ peak: Float, _ now: Double) -> Void = { _, _ in }
+    var reportLevels = false
 
     private let engine = AVAudioEngine()
     private var mode = Mode.off
@@ -91,7 +123,16 @@ final class Mic {
     private var music = MusicFollower()
     private var filter: Biquad?
     private var appliedBand: Band?
+    private var armedAt = 0.0
     private var window: (level: Float, until: Double) = (0, 0)
+
+    init() {
+        _ = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
+            guard let self, mode == .clap else { return }
+            log("audio config changed, restarting mic")
+            do { try set(.clap) } catch { log("mic restart failed: \(error)") }
+        }
+    }
 
     func set(_ m: Mode) throws {
         engine.stop()
@@ -102,6 +143,8 @@ final class Mic {
         case .off: break
         case .clap:
             appliedBand = nil
+            clap = ClapDetector()
+            armedAt = ProcessInfo.processInfo.systemUptime + 0.5
         if !pinned { pinBuiltInMic(); pinned = true }
             engine.inputNode.installTap(onBus: 0, bufferSize: 512, format: nil) { [weak self] buf, _ in
                 guard let x = buf.floatChannelData?[0] else { return }
@@ -129,6 +172,9 @@ final class Mic {
                 for v in chunk { peak = max(peak, abs(v)); sum += v * v }
                 let rms = (sum / Float(chunk.count)).squareRoot()
                 if peak > 0.03 { log(String(format: "%7.2f  peak %.3f  rms %.4f", now.truncatingRemainder(dividingBy: 100), peak, rms)) }
+                clap.thresh = clapThresh
+                guard now > armedAt else { continue }
+                if reportLevels { DispatchQueue.main.async { self.onLevel(peak, now) }; continue }
                 if clap.feed(peak: peak, rms: rms, now: now) { log("clap clap -> toggle"); DispatchQueue.main.async(execute: onClap) }
             case .music:
                 if appliedBand != band {

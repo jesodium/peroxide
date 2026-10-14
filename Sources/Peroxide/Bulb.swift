@@ -1,6 +1,7 @@
 import AVFoundation
 
 @MainActor final class Bulb: ObservableObject {
+    static let shared = Bulb()
     static let configURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/peroxide/devices.json")
 
     @Published var devices = (try? JSONDecoder().decode([Device].self, from: Data(contentsOf: Bulb.configURL))) ?? []
@@ -20,6 +21,14 @@ import AVFoundation
     @Published var musicSensitivity = UserDefaults.standard.object(forKey: "musicSensitivity") as? Double ?? 0.5 {
         didSet { mic.gain = Self.gain(musicSensitivity); UserDefaults.standard.set(musicSensitivity, forKey: "musicSensitivity") }
     }
+    @Published var clapSensitivity = UserDefaults.standard.object(forKey: "clapSensitivity") as? Double ?? 0.5 {
+        didSet { mic.clapThresh = Self.thresh(clapSensitivity); UserDefaults.standard.set(clapSensitivity, forKey: "clapSensitivity") }
+    }
+    var clapCalibrated: Bool { UserDefaults.standard.object(forKey: "clapSensitivity") != nil }
+    @Published private(set) var calibration: ClapCalibrator?
+    @Published private(set) var levels = [Float](repeating: 0, count: 48)
+    private var heardPeak: Float = 0, heardCount = 0
+    private static func thresh(_ s: Double) -> Float { Float(0.2 * pow(0.1, s)) }
     private static func gain(_ s: Double) -> Float { Float(pow(4, s * 2 - 1)) }
 
     private let mic = Mic()
@@ -30,8 +39,10 @@ import AVFoundation
     init() {
         mic.onClap = { [weak self] in self?.toggle() }
         mic.onMusic = { [weak self] in self?.music(level: $0) }
+        mic.onLevel = { [weak self] in self?.heard(peak: $0, now: $1) }
         mic.band = musicBand
         mic.gain = Self.gain(musicSensitivity)
+        mic.clapThresh = Self.thresh(clapSensitivity)
         Task { await refresh() }
         if let m = UserDefaults.standard.string(forKey: "micMode").flatMap(Mic.Mode.init) { setMicMode(m) }
     }
@@ -47,6 +58,49 @@ import AVFoundation
                 return
             }
             do { try mic.set(m) } catch { self.error = error.localizedDescription; micMode = .off }
+        }
+    }
+
+    func startCalibration() {
+        calibration = ClapCalibrator()
+        levels = levels.map { _ in 0 }
+        Task {
+            guard await AVCaptureDevice.requestAccess(for: .audio) else {
+                error = "Allow the microphone in System Settings → Privacy"
+                calibration = nil
+                return
+            }
+            guard calibration != nil else { return }
+            mic.reportLevels = true
+            do { try mic.set(.clap) } catch { self.error = error.localizedDescription; endCalibration() }
+        }
+    }
+
+    func endCalibration() {
+        calibration = nil
+        stopHearing()
+    }
+
+    private func stopHearing() {
+        guard mic.reportLevels else { return }
+        mic.reportLevels = false
+        do { try mic.set(micMode) } catch { self.error = error.localizedDescription }
+    }
+
+    private func heard(peak: Float, now: Double) {
+        guard var c = calibration, mic.reportLevels else { return }
+        c.feed(peak: peak, now: now)
+        calibration = c
+        heardPeak = max(heardPeak, peak)
+        heardCount += 1
+        if heardCount == 3 {
+            levels = Array(levels.dropFirst()) + [heardPeak]
+            (heardPeak, heardCount) = (0, 0)
+        }
+        switch c.phase {
+        case .done(let t): clapSensitivity = min(1, max(0, log10(0.2 / Double(t)))); stopHearing()
+        case .failed: stopHearing()
+        default: break
         }
     }
 

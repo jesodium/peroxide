@@ -28,6 +28,36 @@ final class ClapTests: XCTestCase {
     }
 }
 
+final class CalibratorTests: XCTestCase {
+    func testCalibrates() {
+        var c = ClapCalibrator()
+        for t in stride(from: 0.0, to: 3, by: 0.01) { c.feed(peak: 0.01, now: t) }
+        XCTAssertEqual(c.phase, .clap)
+        for (t, p) in [(4.0, 0.3), (4.01, 0.4), (4.5, 0.25)] as [(Double, Float)] { c.feed(peak: p, now: t) }
+        c.feed(peak: 0.01, now: 5)
+        XCTAssertEqual(c.claps, [0.4, 0.25])
+        guard case .done(let th) = c.phase else { return XCTFail("\(c.phase)") }
+        XCTAssertEqual(th, 0.075, accuracy: 0.0001)
+    }
+
+    func testGivesUpWithoutClaps() {
+        var c = ClapCalibrator()
+        for t in stride(from: 0.0, to: 14, by: 0.01) { c.feed(peak: 0.01, now: t) }
+        guard case .failed = c.phase else { return XCTFail("\(c.phase)") }
+    }
+
+    func testBusyRoom() {
+        var c = ClapCalibrator()
+        for t in stride(from: 0.0, to: 3, by: 0.01) { c.feed(peak: t.truncatingRemainder(dividingBy: 0.5) < 0.01 ? 0.15 : 0.04, now: t) }
+        XCTAssertEqual(c.phase, .clap)
+        c.feed(peak: 0.15, now: 3.5)
+        XCTAssertEqual(c.claps, [], "a normal loud moment isn't a clap")
+        for t in [4.0, 4.5, 5.0] { c.feed(peak: t == 5 ? 0.04 : 0.5, now: t) }
+        guard case .done(let th) = c.phase else { return XCTFail("\(c.phase)") }
+        XCTAssert(th > 0.15 && th < 0.5, "\(th)")
+    }
+}
+
 final class BandTests: XCTestCase {
     func rms(_ band: Mic.Band, hz: Double, sr: Double = 48000) -> Float {
         var f = band.filter(sampleRate: sr)
