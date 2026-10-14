@@ -23,4 +23,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 ID=$(security find-identity -v -p codesigning | awk -F'"' '/Apple Development/ {print $2; exit}')
 codesign --force -s "${ID:--}" "$APP"
-echo "built $APP"
+pkill -x Peroxide || true
+rm -rf /Applications/Peroxide.app && cp -R "$APP" /Applications/
+open /Applications/Peroxide.app
+echo "installed /Applications/Peroxide.app"

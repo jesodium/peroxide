@@ -1,4 +1,6 @@
 import AVFoundation
+import Foundation
+import Network
 
 @MainActor final class Bulb: ObservableObject {
     static let shared = Bulb()
@@ -7,13 +9,14 @@ import AVFoundation
     @Published var devices = (try? JSONDecoder().decode([Device].self, from: Data(contentsOf: Bulb.configURL))) ?? []
     @Published private var selected = UserDefaults.standard.string(forKey: "selected")
     var device: Device? { devices.first { $0.id == selected } ?? devices.first }
-    @Published var on = false
+    @Published var on = false { didSet { if let d = device { power[d.id] = on } } }
+    @Published private(set) var power: [String: Bool] = [:]
     @Published var colour = false
     @Published var brightness = 1.0
     @Published var temp = 0.5
     @Published var hue = 0.0
     @Published var sat = 1.0
-    @Published var error: String?
+    @Published var error: String? { didSet { if let error { log("error: \(error)") } } }
     @Published private(set) var micMode = Mic.Mode.off
     @Published var musicBand = UserDefaults.standard.string(forKey: "musicBand").flatMap(Mic.Band.init) ?? .all {
         didSet { mic.band = musicBand; UserDefaults.standard.set(musicBand.rawValue, forKey: "musicBand") }
@@ -27,6 +30,7 @@ import AVFoundation
     var clapCalibrated: Bool { UserDefaults.standard.object(forKey: "clapSensitivity") != nil }
     @Published private(set) var calibration: ClapCalibrator?
     @Published private(set) var levels = [Float](repeating: 0, count: 48)
+    @Published private(set) var scanning = false
     private var heardPeak: Float = 0, heardCount = 0
     private static func thresh(_ s: Double) -> Float { Float(0.2 * pow(0.1, s)) }
     private static func gain(_ s: Double) -> Float { Float(pow(4, s * 2 - 1)) }
@@ -131,6 +135,75 @@ import AVFoundation
         } catch { if device == d { self.error = error.localizedDescription } }
     }
 
+    func scanNetwork() async {
+        scanning = true
+        defer { scanning = false }
+        guard let subnet = currentSubnet() else { return }
+        await withTaskGroup(of: Device?.self) { group in
+            for i in 1...254 {
+                let ip = "\(subnet).\(i)"
+                group.addTask { await self.probe(ip: ip) }
+            }
+            for await found in group {
+                if let d = found, !devices.contains(where: { $0.id == d.id }) {
+                    devices.append(d)
+                    save()
+                }
+            }
+        }
+    }
+
+    private func probe(ip: String) async -> Device? {
+        let conn = NWConnection(host: .init(ip), port: 6668, using: .tcp)
+        return await withCheckedContinuation { cont in
+            conn.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    conn.cancel()
+                    cont.resume(returning: Device(name: "Smart Bulb", id: "", ip: ip, key: ""))
+                case .failed, .cancelled:
+                    cont.resume(returning: nil)
+                default: break
+                }
+            }
+            conn.start(queue: .global())
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2) { conn.cancel() }
+        }
+    }
+
+    private func currentSubnet() -> String? {
+        var address: String?
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return nil }
+        defer { freeifaddrs(ifaddr) }
+        for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
+            let interface = ptr.pointee
+            let family = interface.ifa_addr.pointee.sa_family
+            guard family == UInt8(AF_INET) else { continue }
+            let name = String(cString: interface.ifa_name)
+            if name == "en0" {
+                var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
+                            &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
+                address = String(cString: hostname)
+            }
+        }
+        guard let addr = address else { return nil }
+        let parts = addr.split(separator: ".")
+        guard parts.count == 4 else { return nil }
+        return "\(parts[0]).\(parts[1]).\(parts[2])"
+    }
+
+    private func save() {
+        let dir = Self.configURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        if let data = try? JSONEncoder().encode(devices) {
+            FileManager.default.createFile(atPath: Self.configURL.path,
+                                           contents: data,
+                                           attributes: [.posixPermissions: 0o600])
+        }
+    }
+
     func apply(_ dps: [String: Any]) {
         if let v = dps["20"] as? Bool { on = v }
         if let v = dps["21"] as? String { colour = v == "colour" }
@@ -146,6 +219,29 @@ import AVFoundation
     func setOn(_ v: Bool) { on = v; send(["20": v]) }
 
     func toggle() { Task { await refresh(); setOn(!on) } }
+
+    func refreshAll() {
+        for d in devices where d != device {
+            Task { if let v = try? await Tuya(device: d).status()["20"] as? Bool { power[d.id] = v } }
+        }
+        Task { await refresh() }
+    }
+
+    func setOn(_ v: Bool, _ d: Device) {
+        guard d != device else { return setOn(v) }
+        power[d.id] = v
+        Task {
+            do { try await Tuya(device: d).set(["20": v]) } catch { self.error = "\(d.name): \(error.localizedDescription)" }
+        }
+    }
+
+    func toggle(_ d: Device) {
+        guard d != device else { return toggle() }
+        Task {
+            let cur = try? await Tuya(device: d).status()["20"] as? Bool
+            setOn(!(cur ?? power[d.id] ?? false), d)
+        }
+    }
 
     // fix later, still a bit choppy
     func music(level: Double) {

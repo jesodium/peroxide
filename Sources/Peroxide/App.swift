@@ -29,7 +29,14 @@ import SwiftUI
         exit(0)
     }
 
-    func applicationDidFinishLaunching(_ n: Notification) { show() }
+    func applicationDidFinishLaunching(_ n: Notification) {
+        Hotkeys.start()
+        // stay quiet in the menu bar when macOS opens us at login
+        let ev = NSAppleEventManager.shared().currentAppleEvent
+        let atLogin = ev?.eventID == kAEOpenApplication
+            && ev?.paramDescriptor(forKeyword: keyAEPropData)?.enumCodeValue == keyAELaunchedAsLogInItem
+        if !atLogin { show() }
+    }
 
     func applicationShouldHandleReopen(_ app: NSApplication, hasVisibleWindows: Bool) -> Bool {
         show()
@@ -53,6 +60,7 @@ struct Panel: View {
             HStack {
                 if let e = bulb.error { Text(e).font(.caption).foregroundStyle(.red).lineLimit(2) }
                 Spacer()
+                Button("Settings…") { SettingsWindow.show() }.keyboardShortcut(",")
                 Button("Quit") { NSApp.terminate(nil) }.keyboardShortcut("q")
             }
         }
@@ -64,6 +72,7 @@ struct Panel: View {
 
 struct Controls: View {
     @EnvironmentObject var bulb: Bulb
+    var picker = true
     let onAdd: () -> Void
 
     static let swatches: [(String, Double, Double)] = [
@@ -72,7 +81,7 @@ struct Controls: View {
     ]
 
     var body: some View {
-        HStack {
+        if picker { HStack {
             // kinda hacky but works
             Picker("Light", selection: .init(get: { bulb.device?.id ?? "" }, set: { $0 == "+" ? onAdd() : bulb.select($0) })) {
                 ForEach(bulb.devices, id: \.id) { Text($0.name).tag($0.id) }
@@ -85,7 +94,7 @@ struct Controls: View {
             Toggle("On", isOn: .init(get: { bulb.on }, set: bulb.setOn))
                 .toggleStyle(.switch)
                 .labelsHidden()
-        }
+        } }
 
         row("sun.max", "Brightness") {
             Slider(value: .init(get: { bulb.brightness }, set: bulb.setBrightness))
@@ -299,8 +308,15 @@ struct Setup: View {
 
     var body: some View {
         Text("Add a light").font(.headline)
+        if bulb.scanning {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Looking at your network for smart devices…")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
         Text("Get the device ID and local key with `python3 -m tinytuya wizard`.")
-            .font(.caption).foregroundStyle(.secondary)
+        .font(.caption).foregroundStyle(.secondary)
         TextField("Name", text: $name)
         TextField("Device ID", text: $id)
         TextField("IP address", text: $ip)
@@ -308,16 +324,23 @@ struct Setup: View {
         HStack {
             if !bulb.devices.isEmpty { Button("Cancel", action: done).keyboardShortcut(.cancelAction) }
             Spacer()
-            Button("Save") {
-                do {
-                    // validate ip later
-                    try bulb.add(Device(name: name.trimmed.isEmpty ? "Light" : name.trimmed, id: id.trimmed, ip: ip.trimmed, key: key))
-                    done()
-                } catch { bulb.error = error.localizedDescription }
+            if bulb.scanning {
+                Button("Scanning…") {}.disabled(true).keyboardShortcut(.defaultAction)
+            } else {
+                Button("Save") {
+                    do {
+                        try bulb.add(Device(name: name.trimmed.isEmpty ? "Light" : name.trimmed, id: id.trimmed, ip: ip.trimmed, key: key))
+                        done()
+                    } catch { bulb.error = error.localizedDescription }
+                }
+                .disabled(id.trimmed.isEmpty || ip.trimmed.isEmpty || key.utf8.count != 16)
+                .keyboardShortcut(.defaultAction)
             }
-            .disabled(id.trimmed.isEmpty || ip.trimmed.isEmpty || key.utf8.count != 16)
-            .keyboardShortcut(.defaultAction)
         }
+        Button("Scan network for devices") {
+            Task { await bulb.scanNetwork() }
+        }
+        .disabled(bulb.scanning)
     }
 }
 

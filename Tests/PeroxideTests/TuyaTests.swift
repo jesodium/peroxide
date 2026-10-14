@@ -1,3 +1,4 @@
+import Carbon.HIToolbox
 import XCTest
 @testable import Peroxide
 
@@ -73,5 +74,13 @@ final class BandTests: XCTestCase {
         XCTAssertGreaterThan(rms(.mids, hz: 1000), 0.6)
         XCTAssertLessThan(rms(.mids, hz: 60), 0.15)
         XCTAssertEqual(rms(.all, hz: 440), 0.707, accuracy: 0.01)
+    }
+}
+
+@MainActor final class HotkeyTests: XCTestCase {
+    func testMods() {
+        let m = Hotkeys.carbon([.command, .control, .capsLock])
+        XCTAssertEqual(m, cmdKey | controlKey)
+        XCTAssertEqual(Hotkeys.symbols(m), "⌃⌘")
     }
 }

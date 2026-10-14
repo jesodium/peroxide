@@ -36,8 +36,7 @@ struct Tuya {
         let conn = NWConnection(host: .init(device.ip), port: 6668, using: .tcp)
         conn.start(queue: .global())
         defer { conn.cancel() }
-        // is 3s enough? check on slow wifi
-        DispatchQueue.global().asyncAfter(deadline: .now() + 3) { conn.cancel() }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 10) { conn.cancel() }
 
         try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
             conn.send(content: frame(cmd: cmd, payload: payload), completion: .contentProcessed { e in
