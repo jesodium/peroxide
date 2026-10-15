@@ -2,6 +2,77 @@ import CommonCrypto
 import Foundation
 import Network
 
+struct TuyaCloud {
+    let apiKey: String
+    let apiSecret: String
+    let region: String
+
+    private var baseURL: String {
+        switch region {
+        case "eu": return "https://openapi.tuyaeu.com"
+        case "cn": return "https://openapi.tuyacn.com"
+        case "in": return "https://openapi.tuyain.com"
+        default: return "https://openapi.tuyaus.com"
+        }
+    }
+
+    private func sign(_ path: String, _ method: String, _ body: String = "") -> [String: String] {
+        let t = String(Int(Date().timeIntervalSince1970 * 1000))
+        let nonce = UUID().uuidString.prefix(8)
+        let contentHash = sha256(body)
+        let stringToSign = "\(method)\n\(contentHash)\n\n\(path)"
+        let signStr = apiKey + t + String(nonce) + stringToSign
+        let signature = hmac(signStr, key: apiSecret).uppercased()
+        return ["client_id": apiKey, "t": t, "sign_method": "HMAC-SHA256", "nonce": String(nonce), "sign": signature]
+    }
+
+    private func sha256(_ s: String) -> String {
+        let d = Data(s.utf8)
+        var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        d.withUnsafeBytes { _ = CC_SHA256($0.baseAddress, CC_LONG(d.count), &hash) }
+        return hash.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func hmac(_ s: String, key: String) -> String {
+        var code = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        let k = Array(key.utf8), m = Array(s.utf8)
+        CCHmac(CCHmacAlgorithm(kCCHmacAlgSHA256), k, k.count, m, m.count, &code)
+        return code.map { String(format: "%02x", $0) }.joined()
+    }
+
+    func token() async throws -> String {
+        let path = "/v1.0/token?grant_type=1"
+        let headers = sign(path, "GET")
+        var req = URLRequest(url: URL(string: baseURL + path)!)
+        for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+        let (data, _) = try await URLSession.shared.data(for: req)
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let result = obj["result"] as? [String: Any],
+              let token = result["access_token"] as? String
+        else { throw TuyaError.badReply("Token failed") }
+        return token
+    }
+
+    func devices() async throws -> [Device] {
+        let token = try await token()
+        let path = "/v1.0/users/\(apiKey)/devices"
+        let headers = sign(path, "GET")
+        var req = URLRequest(url: URL(string: baseURL + path)!)
+        for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+        req.setValue(token, forHTTPHeaderField: "access_token")
+        let (data, _) = try await URLSession.shared.data(for: req)
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let result = obj["result"] as? [[String: Any]]
+        else { throw TuyaError.badReply("Device list failed") }
+        return result.compactMap { d in
+            guard let id = d["id"] as? String, let key = d["local_key"] as? String,
+                  let ip = d["ip"] as? String, let name = d["name"] as? String
+            else { return nil }
+            return Device(name: name, id: id, ip: ip, key: key)
+        }
+    }
+}
+
 struct Device: Codable, Hashable { var name, id, ip, key: String }
 
 enum TuyaError: LocalizedError {

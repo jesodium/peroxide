@@ -1,6 +1,32 @@
 import AVFoundation
+import CommonCrypto
 import Foundation
 import Network
+import Security
+
+enum Keychain {
+    static func get(_ key: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: key,
+            kSecReturnData as String: true
+        ]
+        var result: AnyObject?
+        SecItemCopyMatching(query as CFDictionary, &result)
+        guard let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func set(_ key: String, value: String) {
+        let data = Data(value.utf8)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: key
+        ]
+        SecItemDelete(query as CFDictionary)
+        SecItemAdd(query.merging([kSecValueData as String: data]) { _, new in new } as CFDictionary, nil)
+    }
+}
 
 @MainActor final class Bulb: ObservableObject {
     static let shared = Bulb()
@@ -31,6 +57,12 @@ import Network
     @Published private(set) var calibration: ClapCalibrator?
     @Published private(set) var levels = [Float](repeating: 0, count: 48)
     @Published private(set) var scanning = false
+    @Published var cloudApiKey = Keychain.get("tuya_api_key") ?? "" {
+        didSet { Keychain.set("tuya_api_key", value: cloudApiKey) }
+    }
+    @Published var cloudApiSecret = Keychain.get("tuya_api_secret") ?? "" {
+        didSet { Keychain.set("tuya_api_secret", value: cloudApiSecret) }
+    }
     private var heardPeak: Float = 0, heardCount = 0
     private static func thresh(_ s: Double) -> Float { Float(0.2 * pow(0.1, s)) }
     private static func gain(_ s: Double) -> Float { Float(pow(4, s * 2 - 1)) }
@@ -204,6 +236,30 @@ import Network
         }
     }
 
+    func cloudScan() async {
+        scanning = true
+        defer { scanning = false }
+        guard !cloudApiKey.isEmpty, !cloudApiSecret.isEmpty else {
+            error = "Enter Tuya cloud API key and secret in Settings"
+            return
+        }
+        do {
+            let cloud = TuyaCloud(apiKey: cloudApiKey, apiSecret: cloudApiSecret, region: "eu")
+            let found = try await cloud.devices()
+            for d in found where !devices.contains(where: { $0.id == d.id }) {
+                devices.append(d)
+            }
+            save()
+            if found.isEmpty { error = "No Tuya devices found in cloud account" }
+        } catch { self.error = error.localizedDescription }
+    }
+
+    func rename(_ id: String, to name: String) {
+        guard let i = devices.firstIndex(where: { $0.id == id }) else { return }
+        devices[i].name = name
+        save()
+    }
+
     func apply(_ dps: [String: Any]) {
         if let v = dps["20"] as? Bool { on = v }
         if let v = dps["21"] as? String { colour = v == "colour" }
@@ -245,8 +301,12 @@ import Network
 
     // fix later, still a bit choppy
     func music(level: Double) {
-        colour = true; on = true
-        send(["20": true, "21": "colour", "24": hsv(max(0.01, brightness * level))])
+        on = true
+        if colour {
+            send(["20": true, "21": "colour", "24": hsv(max(0.01, brightness * level))])
+        } else {
+            send(["20": true, "21": "white", "22": level(max(0.01, brightness * level)), "23": Int(temp * 1000)])
+        }
     }
 
     func setBrightness(_ v: Double) {
